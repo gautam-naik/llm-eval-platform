@@ -1,83 +1,101 @@
 # ci/regression_check.py
 import sys
+
 import pandas as pd
-from storage.supabase_client import client
+
 from config.settings import REGRESSION_TOLERANCE
+from storage.supabase_client import client, is_supabase_configured
+
 
 def run_regression_check():
     print("🔍 RUNNING AUTOMATED LLM QUALITY REGRESSION CHECK...")
     print("=" * 65)
 
-    # 1. Fetch evaluation history from Supabase
-    res = client.table("eval_results").select("*").execute()
-    data = res.data
+    # CI runs may not have database credentials (for example, on external PRs).
+    # Avoid dereferencing a missing client; report the skipped gate explicitly.
+    if not is_supabase_configured() or client is None:
+        print("⚠️ Supabase is not configured; skipping the regression comparison.")
+        print("   Set SUPABASE_URL and SUPABASE_KEY in the repository or environment secrets to enable it.")
+        return 0
 
+    try:
+        response = client.table("eval_results").select("*").execute()
+    except Exception as exc:
+        print(f"❌ Could not fetch evaluation history from Supabase: {exc}", file=sys.stderr)
+        return 1
+
+    data = response.data
     if not data or len(data) < 2:
-        print("⚠️ Not enough evaluation runs in Supabase to perform a regression comparison.")
+        print("⚠️ Not enough evaluation results in Supabase to perform a regression comparison.")
         print("✅ Passing check as initial baseline setup.")
-        sys.exit(0)
+        return 0
 
     df = pd.DataFrame(data)
+    required_columns = {"id", "eval_version", "judge_faithfulness", "bertscore_f1"}
+    missing_columns = required_columns.difference(df.columns)
+    if missing_columns:
+        print(
+            "❌ Evaluation results are missing required columns: "
+            + ", ".join(sorted(missing_columns)),
+            file=sys.stderr,
+        )
+        return 1
 
-    # Convert timestamp to datetime if present, otherwise sort by ID
-    df["id"] = df["id"].astype(int)
-    df = df.sort_values("id")
+    df["id"] = pd.to_numeric(df["id"], errors="coerce")
+    df = df.dropna(subset=["id"]).sort_values("id")
+    versions = df["eval_version"].dropna().unique()
 
-    # Get distinct versions or run batches
-    versions = df["eval_version"].unique()
-    
     if len(versions) < 2:
-        print("ℹ️ Only 1 eval version found. Setting current run as baseline.")
-        sys.exit(0)
+        print("ℹ️ Only one evaluation version found. Setting it as the baseline.")
+        return 0
 
-    baseline_version = versions[-2]
-    current_version = versions[-1]
-
+    baseline_version, current_version = versions[-2], versions[-1]
     print(f"📊 Comparing Current Run [{current_version}] vs Baseline Run [{baseline_version}]")
 
-    # Calculate average scores
     baseline_df = df[df["eval_version"] == baseline_version]
     current_df = df[df["eval_version"] == current_version]
-
-    metrics = ["judge_faithfulness", "bertscore_f1", "rouge_l_f1", "latency_ms"]
-
-    b_faith = baseline_df["judge_faithfulness"].mean()
-    c_faith = current_df["judge_faithfulness"].mean()
-
-    b_bert = baseline_df["bertscore_f1"].mean()
-    c_bert = current_df["bertscore_f1"].mean()
+    baseline_faith = baseline_df["judge_faithfulness"].mean()
+    current_faith = current_df["judge_faithfulness"].mean()
+    baseline_bert = baseline_df["bertscore_f1"].mean()
+    current_bert = current_df["bertscore_f1"].mean()
 
     print("\n--- BENCHMARK COMPARISON SUMMARY ---")
-    print(f"Faithfulness : Baseline = {b_faith:.2f} | Current = {c_faith:.2f}")
-    print(f"BERTScore    : Baseline = {b_bert:.3f} | Current = {c_bert:.3f}")
-
-    # Calculate percentage changes
-    faith_change = (c_faith - b_faith) / b_faith if b_faith > 0 else 0
-    bert_change = (c_bert - b_bert) / b_bert if b_bert > 0 else 0
+    print(f"Faithfulness : Baseline = {baseline_faith:.2f} | Current = {current_faith:.2f}")
+    print(f"BERTScore    : Baseline = {baseline_bert:.3f} | Current = {current_bert:.3f}")
 
     has_regression = False
     reasons = []
 
-    # Check against tolerance threshold (e.g., 0.05 = 5% drop)
-    if faith_change < -REGRESSION_TOLERANCE:
-        has_regression = True
-        reasons.append(f"Faithfulness dropped by {abs(faith_change)*100:.1f}% (Threshold: {REGRESSION_TOLERANCE*100}%)")
+    if pd.notna(baseline_faith) and baseline_faith > 0:
+        faith_change = (current_faith - baseline_faith) / baseline_faith
+        if faith_change < -REGRESSION_TOLERANCE:
+            has_regression = True
+            reasons.append(
+                f"Faithfulness dropped by {abs(faith_change) * 100:.1f}% "
+                f"(Threshold: {REGRESSION_TOLERANCE * 100}%)"
+            )
 
-    if bert_change < -REGRESSION_TOLERANCE:
-        has_regression = True
-        reasons.append(f"BERTScore dropped by {abs(bert_change)*100:.1f}% (Threshold: {REGRESSION_TOLERANCE*100}%)")
+    if pd.notna(baseline_bert) and baseline_bert > 0:
+        bert_change = (current_bert - baseline_bert) / baseline_bert
+        if bert_change < -REGRESSION_TOLERANCE:
+            has_regression = True
+            reasons.append(
+                f"BERTScore dropped by {abs(bert_change) * 100:.1f}% "
+                f"(Threshold: {REGRESSION_TOLERANCE * 100}%)"
+            )
 
     print("=" * 65)
     if has_regression:
         print("❌ QUALITY REGRESSION DETECTED! BUILD FAILED.")
-        for r in reasons:
-            print(f"   • {r}")
+        for reason in reasons:
+            print(f"   • {reason}")
         print("=" * 65)
-        sys.exit(1)  # Exits with non-zero code to fail GitHub Actions workflow
-    else:
-        print("✅ QUALITY CHECKS PASSED. NO SIGNIFICANT REGRESSION DETECTED.")
-        print("=" * 65)
-        sys.exit(0)
+        return 1
+
+    print("✅ QUALITY CHECKS PASSED. NO SIGNIFICANT REGRESSION DETECTED.")
+    print("=" * 65)
+    return 0
+
 
 if __name__ == "__main__":
-    run_regression_check()
+    sys.exit(run_regression_check())
